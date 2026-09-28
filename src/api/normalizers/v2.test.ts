@@ -26,6 +26,22 @@ function threadReadResponseWithContent(content: ThreadReadResponse['thread']['tu
 }
 
 describe('normalizeThreadMessagesV2', () => {
+  it('renders a sanitized generated image with a remote result URL', () => {
+    const response = threadReadResponseWithContent([{
+      id: 'generated-remote',
+      type: 'imageGeneration',
+      result: 'https://images.example.test/generated/result.png',
+    } as never])
+
+    expect(normalizeThreadMessagesV2(response)).toEqual([
+      expect.objectContaining({
+        id: 'generated-remote',
+        images: ['https://images.example.test/generated/result.png'],
+        messageType: 'imageView',
+      }),
+    ])
+  })
+
   it('preserves selected skill inputs on the rendered user message', () => {
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
       type: 'userMessage',

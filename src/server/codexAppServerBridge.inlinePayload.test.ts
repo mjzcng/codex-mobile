@@ -897,6 +897,30 @@ describe('thread inline media sanitization', () => {
     expect(gifView.path).toMatch(/\.gif$/u)
   })
 
+  it('retains a validated remote source when a generated image has no local fallback', async () => {
+    const remoteUrl = 'https://images.example.test/generated/result.png'
+    const result = await sanitizeThreadTurnsInlinePayloads('thread/read', {
+      thread: {
+        turns: [{
+          id: 'turn-remote',
+          items: [
+            { id: 'remote-result', type: 'imageGeneration', result: remoteUrl },
+            { id: 'remote-url', type: 'imageView', path: '/missing.png', url: remoteUrl },
+          ],
+        }],
+      },
+    }) as { thread: { turns: Array<{ items: Array<Record<string, unknown>> }> } }
+
+    for (const item of result.thread.turns[0].items) {
+      expect(item).toMatchObject({
+        type: 'imageGeneration',
+        result: remoteUrl,
+      })
+      expect(item).not.toHaveProperty('url')
+      expect(item).not.toHaveProperty('path')
+    }
+  })
+
   it('recovers generated images whose only fallback is in URL or image-list fields', async () => {
     const result = await sanitizeThreadTurnsInlinePayloads('thread/read', {
       thread: {
