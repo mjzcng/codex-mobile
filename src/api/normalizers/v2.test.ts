@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeThreadMessagesV2, readThreadInProgressFromResponse } from './v2'
+import { normalizeThreadMessagesV2, readActiveTurnIdFromResponse, readThreadInProgressFromResponse } from './v2'
 import type { ThreadReadResponse } from '../appServerDtos'
 
 function threadReadResponseWithContent(content: ThreadReadResponse['thread']['turns'][number]['items'][number][]): ThreadReadResponse {
@@ -214,5 +214,14 @@ describe('readThreadInProgressFromResponse', () => {
     ;(response.thread as unknown as { status: { type: string } }).status = { type: 'active' }
 
     expect(readThreadInProgressFromResponse(response)).toBe(true)
+  })
+})
+
+describe('readActiveTurnIdFromResponse', () => {
+  it('returns the ID of a recovered in-progress turn', () => {
+    const response = threadReadResponseWithContent([])
+    response.thread.turns[0].status = 'inProgress'
+
+    expect(readActiveTurnIdFromResponse(response)).toBe('turn-1')
   })
 })

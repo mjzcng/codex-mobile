@@ -1108,14 +1108,12 @@ type InlineMediaPersistenceTask = {
   reject: (error: unknown) => void
 }
 const inlineMediaPersistenceQueue: InlineMediaPersistenceTask[] = []
-const inlineMediaPersistenceCapacityWaiters: Array<() => void> = []
 let activeInlineMediaPersistenceTasks = 0
 
 function drainInlineMediaPersistenceQueue(): void {
   while (activeInlineMediaPersistenceTasks < INLINE_MEDIA_PERSIST_CONCURRENCY) {
     const task = inlineMediaPersistenceQueue.shift()
     if (!task) return
-    inlineMediaPersistenceCapacityWaiters.shift()?.()
     activeInlineMediaPersistenceTasks += 1
     void task.run()
       .then(task.resolve, task.reject)
@@ -1127,9 +1125,7 @@ function drainInlineMediaPersistenceQueue(): void {
 }
 
 async function scheduleInlineMediaPersistence(run: () => Promise<string | null>): Promise<string | null> {
-  while (inlineMediaPersistenceQueue.length >= INLINE_MEDIA_PERSIST_QUEUE_LIMIT) {
-    await new Promise<void>((resolve) => inlineMediaPersistenceCapacityWaiters.push(resolve))
-  }
+  if (inlineMediaPersistenceQueue.length >= INLINE_MEDIA_PERSIST_QUEUE_LIMIT) return null
   return new Promise<string | null>((resolve, reject) => {
     inlineMediaPersistenceQueue.push({ run, resolve, reject })
     drainInlineMediaPersistenceQueue()
@@ -6650,6 +6646,7 @@ type CapturedItem = {
   turnId: string
   data: Record<string, unknown>
   completed: boolean
+  turnCompleted: boolean
   sanitized: boolean
   sanitizePromise: Promise<void> | null
   capturedAtMs: number
@@ -7101,10 +7098,21 @@ export class AppServerProcess {
   }
 
   private captureItemFromNotification(notification: { method: string; params: unknown }): void {
-    if (notification.method !== 'item/started' && notification.method !== 'item/completed') return
-
     const params = asRecord(notification.params)
     if (!params) return
+    if (notification.method === 'turn/completed') {
+      const threadId = this.extractThreadIdFromParams(params)
+      const turnId = readStreamTurnId(params)
+      const threadItems = threadId ? this.capturedItemsByThreadId.get(threadId) : null
+      if (turnId && threadItems) {
+        for (const captured of threadItems.values()) {
+          if (captured.turnId === turnId) captured.turnCompleted = true
+        }
+      }
+      return
+    }
+    if (notification.method !== 'item/started' && notification.method !== 'item/completed') return
+
     const item = asRecord(params.item)
     if (!item) return
     const itemType = typeof item.type === 'string' ? item.type : ''
@@ -7139,6 +7147,7 @@ export class AppServerProcess {
       turnId,
       data: item as Record<string, unknown>,
       completed: isCompleted,
+      turnCompleted: this.hasCompletedTurnEvent(threadId, turnId),
       sanitized: false,
       sanitizePromise: null,
       capturedAtMs: Date.now(),
@@ -7171,6 +7180,17 @@ export class AppServerProcess {
         this.pruneCapturedItemsGlobally()
       })
     }
+  }
+
+  private hasCompletedTurnEvent(threadId: string, turnId: string): boolean {
+    const events = this.streamEventsByThreadId.get(threadId) ?? []
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const frame = events[index]
+      if (frame.method !== 'turn/completed') continue
+      const params = asRecord(frame.params)
+      if (params && readStreamTurnId(params) === turnId) return true
+    }
+    return false
   }
 
   private clearCapturedItemCleanupTimer(threadId: string): void {
@@ -7480,8 +7500,11 @@ export class AppServerProcess {
     if (appendMissingTurns) {
       for (const [turnId, captured] of itemsByTurnId) {
         if (mergedTurnIds.has(turnId)) continue
+        const status = captured.every((item) => item.turnCompleted) ? 'completed' : 'inProgress'
+        if (status === 'completed' && mergedTurns.length > 0) continue
         mergedTurns.push({
           id: turnId,
+          status,
           items: captured.map((item) => item.data),
         })
       }
@@ -8934,7 +8957,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             includeTurns: true,
           }))
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
-          const mergedSanitized = await mergeCapturedItemsIntoThreadResult(appServer, sanitized)
+          const mergedSanitized = await mergeCapturedItemsIntoThreadResult(appServer, sanitized, true)
 
           const record = asRecord(mergedSanitized)
           const thread = asRecord(record?.thread)
@@ -8996,9 +9019,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           setJson(res, 200, responseData)
         } catch (error) {
           if (isThreadMaterializationPendingError(error)) {
+            const pendingResult = await mergeCapturedItemsIntoThreadResult(appServer, {
+              thread: {
+                id: threadId,
+                turns: [],
+                status: { type: 'inProgress' },
+              },
+            }, true)
+            const pendingRecord = asRecord(pendingResult)
+            const pendingThread = asRecord(pendingRecord?.thread)
+            const pendingTurns = Array.isArray(pendingThread?.turns) ? pendingThread.turns : []
             setJson(res, 200, {
               threadId,
-              conversationState: { turns: [] },
+              conversationState: { turns: pendingTurns },
               ownerClientId: null,
               liveStateError: null,
               isInProgress: true,
@@ -9011,7 +9044,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             const record = asRecord(snapshot)
             const thread = asRecord(record?.thread)
             const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-            const turns = await appServer.mergeItemsIntoTurns(threadId, rawTurns)
+            const turns = await appServer.mergeItemsIntoTurns(threadId, rawTurns, true)
+            const lastTurn = turns.length > 0 ? asRecord(turns[turns.length - 1]) : null
             setJson(res, 200, {
               threadId,
               conversationState: { turns },
@@ -9020,7 +9054,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 kind: 'readFailed',
                 message: getErrorMessage(error, 'thread/read failed'),
               },
-              isInProgress: false,
+              isInProgress: lastTurn?.status === 'inProgress',
             })
           } else {
             setJson(res, 200, {
