@@ -1322,6 +1322,38 @@ async function resolveGeneratedImageFallbackPath(
   return null
 }
 
+function resolveGeneratedImageRemoteUrl(record: Record<string, unknown>): string | null {
+  const candidates: unknown[] = [record.result, record.url, record.image_url]
+  if (Array.isArray(record.images)) candidates.push(...record.images.slice(0, 32))
+  for (const candidate of candidates) {
+    const candidateRecord = asRecord(candidate)
+    const rawUrl = asNonEmptyString(candidateRecord?.url)
+      ?? asNonEmptyString(candidateRecord?.image_url)
+      ?? asNonEmptyString(candidate)
+    if (!rawUrl || rawUrl.length > 8192) continue
+    try {
+      const parsed = new URL(rawUrl)
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return rawUrl
+    } catch {
+      // Not a valid remote URL.
+    }
+  }
+  return null
+}
+
+function retainGeneratedImageRemoteUrl(record: Record<string, unknown>): Record<string, unknown> {
+  const sanitized = omitGeneratedImagePayloadFields(record)
+  const withoutInvalidPath = { ...sanitized }
+  delete withoutInvalidPath.path
+  const remoteUrl = resolveGeneratedImageRemoteUrl(record)
+  if (!remoteUrl) return withoutInvalidPath
+  return {
+    ...withoutInvalidPath,
+    type: 'imageGeneration',
+    result: remoteUrl,
+  }
+}
+
 export async function sanitizeThreadItemsForTurn(turnId: string, items: unknown[]): Promise<unknown[]> {
   const result = await sanitizeThreadTurnsInlinePayloads('thread/read', {
     thread: {
@@ -1379,7 +1411,7 @@ async function sanitizeInlineUserContentBlock(
         path: fallbackPath,
       }
     }
-    return omitGeneratedImagePayloadFields(record)
+    return retainGeneratedImageRemoteUrl(record)
   }
 
   if (type === 'imageGeneration' || type === 'image_generation') {
@@ -1391,7 +1423,7 @@ async function sanitizeInlineUserContentBlock(
         path: fallbackPath,
       }
     }
-    return omitGeneratedImagePayloadFields(record)
+    return retainGeneratedImageRemoteUrl(record)
   }
 
   const imageUrl = asNonEmptyString(record.url) ?? asNonEmptyString(record.image_url)
@@ -9056,13 +9088,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             includeTurns: true,
           }))
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
-          const mergedSanitized = await mergeCapturedItemsIntoThreadResult(appServer, sanitized, true)
+          const sanitizedRecord = asRecord(sanitized)
+          const sanitizedThread = asRecord(sanitizedRecord?.thread)
+          const materializedTurns = Array.isArray(sanitizedThread?.turns) ? sanitizedThread.turns : []
 
-          const record = asRecord(mergedSanitized)
-          const thread = asRecord(record?.thread)
-          const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-
-          const sessionPath = readNonEmptyString(thread?.path)
+          const sessionPath = readNonEmptyString(sanitizedThread?.path)
           let sessionSize = 0
           if (sessionPath && isAbsolute(sessionPath)) {
             try {
@@ -9072,12 +9102,17 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           }
 
           const cached = appServer.getNotificationGeneration(threadId) === notificationGeneration
-            ? appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
+            ? appServer.getCachedLiveState(threadId, materializedTurns.length, sessionSize)
             : null
           if (cached) {
             setJson(res, 200, cached)
             return
           }
+
+          const mergedSanitized = await mergeCapturedItemsIntoThreadResult(appServer, sanitized, true)
+          const record = asRecord(mergedSanitized)
+          const thread = asRecord(record?.thread)
+          const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
 
           let turns = rawTurns
 
@@ -9108,7 +9143,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               threadId,
               notificationGeneration,
               responseData,
-              rawTurns.length,
+              materializedTurns.length,
               sessionSize,
             )
           }
