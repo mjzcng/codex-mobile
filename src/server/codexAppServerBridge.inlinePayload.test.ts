@@ -531,7 +531,7 @@ describe('thread inline media sanitization', () => {
     appServer.dispose()
   })
 
-  it('shares live image cleanup, defers replacements, and merges them into thread reads', async () => {
+  it('shares live image cleanup and folds equivalent completion metadata into the running job', async () => {
     let releaseSanitizer: (() => void) | undefined
     const sanitizerGate = new Promise<void>((resolve) => {
       releaseSanitizer = resolve
@@ -552,7 +552,7 @@ describe('thread inline media sanitization', () => {
       params: {
         threadId: 'thread-live',
         turnId: 'turn-live',
-        item: { id: 'generated-live', type: 'imageGeneration', result: pngBase64 },
+        item: { id: 'generated-live', type: 'imageGeneration', status: 'inProgress', result: pngBase64 },
       },
     })
     const firstRead = appServer.mergeItemsIntoTurns('thread-live', turns)
@@ -565,22 +565,29 @@ describe('thread inline media sanitization', () => {
       params: {
         threadId: 'thread-live',
         turnId: 'turn-live',
-        item: { id: 'generated-live', type: 'imageGeneration', result: pngBase64 },
+        item: { id: 'generated-live', type: 'imageGeneration', status: 'completed', result: pngBase64 },
       },
     })
     releaseSanitizer?.()
 
     for (const mergedTurns of await Promise.all([firstRead, concurrentRead])) {
-      expect((mergedTurns[0] as { items: unknown[] }).items).toEqual([])
+      expect((mergedTurns[0] as { items: Array<Record<string, unknown>> }).items).toEqual([
+        expect.objectContaining({
+          id: 'generated-live',
+          type: 'imageView',
+          status: 'completed',
+        }),
+      ])
     }
-    expect(sanitizer).toHaveBeenCalledTimes(2)
+    expect(sanitizer).toHaveBeenCalledTimes(1)
 
     const mergedResult = await mergeCapturedItemsIntoThreadResult(appServer, {
       thread: { id: 'thread-live', turns },
     }) as { thread: { turns: Array<{ items: Array<Record<string, unknown>> }> } }
     const imageView = mergedResult.thread.turns[0].items[0]
-    expect(sanitizer).toHaveBeenCalledTimes(2)
+    expect(sanitizer).toHaveBeenCalledTimes(1)
     expect(imageView.type).toBe('imageView')
+    expect(imageView.status).toBe('completed')
     expect(imageView).not.toHaveProperty('result')
     expect(existsSync(imageView.path as string)).toBe(true)
 

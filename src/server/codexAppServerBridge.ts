@@ -6647,10 +6647,66 @@ type CapturedItem = {
   data: Record<string, unknown>
   completed: boolean
   turnCompleted: boolean
+  latestEquivalentData: Record<string, unknown> | null
   sanitized: boolean
   sanitizePromise: Promise<void> | null
   capturedAtMs: number
   estimatedBytes: number
+}
+
+const CAPTURED_IMAGE_PAYLOAD_FIELDS = [
+  'result',
+  'b64_json',
+  'image',
+  'url',
+  'image_url',
+  'images',
+  'path',
+  'mime_type',
+  'mimeType',
+] as const
+
+function equivalentCapturedImagePayload(left: Record<string, unknown>, right: Record<string, unknown>): boolean {
+  let hasPayload = false
+  const equivalentValue = (leftValue: unknown, rightValue: unknown, depth: number): boolean => {
+    if (leftValue === rightValue) return true
+    if (depth >= 3 || !leftValue || !rightValue || typeof leftValue !== 'object' || typeof rightValue !== 'object') {
+      return false
+    }
+    if (Array.isArray(leftValue) || Array.isArray(rightValue)) {
+      if (!Array.isArray(leftValue) || !Array.isArray(rightValue) || leftValue.length !== rightValue.length) return false
+      if (leftValue.length > 32) return false
+      return leftValue.every((entry, index) => equivalentValue(entry, rightValue[index], depth + 1))
+    }
+    const leftRecord = asRecord(leftValue)
+    const rightRecord = asRecord(rightValue)
+    if (!leftRecord || !rightRecord) return false
+    return CAPTURED_IMAGE_PAYLOAD_FIELDS.every((field) => equivalentValue(
+      leftRecord[field],
+      rightRecord[field],
+      depth + 1,
+    ))
+  }
+
+  for (const field of CAPTURED_IMAGE_PAYLOAD_FIELDS) {
+    if (left[field] !== undefined || right[field] !== undefined) hasPayload = true
+    if (!equivalentValue(left[field], right[field], 0)) return false
+  }
+  return hasPayload
+}
+
+function mergeEquivalentCapturedImageMetadata(
+  sanitizedData: Record<string, unknown>,
+  latestData: Record<string, unknown>,
+): Record<string, unknown> {
+  const renderedType = sanitizedData.type
+  const renderedPath = sanitizedData.path
+  return {
+    ...sanitizedData,
+    ...omitGeneratedImagePayloadFields(latestData),
+    type: renderedType,
+    path: renderedPath,
+  }
 }
 
 const CAPTURED_ITEM_MAX_COUNT_PER_THREAD = 100
@@ -7140,6 +7196,35 @@ export class AppServerProcess {
 
     if (existing && existing.completed && !isCompleted) return
 
+    const isGeneratedImage = itemType === 'imageGeneration'
+      || itemType === 'image_generation'
+      || itemType === 'imageView'
+    if (existing
+      && isGeneratedImage
+      && existing.type === itemType
+      && existing.turnId === turnId
+      && equivalentCapturedImagePayload(existing.latestEquivalentData ?? existing.data, item)) {
+      const previousEstimatedBytes = existing.estimatedBytes
+      existing.completed ||= isCompleted
+      existing.turnCompleted ||= this.hasCompletedTurnEvent(threadId, turnId)
+      existing.latestEquivalentData = item
+      existing.capturedAtMs = Date.now()
+      existing.estimatedBytes = estimateCapturedItemBytes(item)
+      this.capturedItemEstimatedBytesTotal = Math.max(
+        0,
+        this.capturedItemEstimatedBytesTotal + existing.estimatedBytes - previousEstimatedBytes,
+      )
+      if (existing.sanitized) {
+        existing.data = mergeEquivalentCapturedImageMetadata(existing.data, item)
+        existing.latestEquivalentData = null
+      }
+      this.capturedItemsByThreadId.delete(threadId)
+      this.capturedItemsByThreadId.set(threadId, threadItems)
+      this.pruneCapturedItemsForThread(threadId)
+      this.pruneCapturedItemsGlobally()
+      return
+    }
+
     const captured: CapturedItem = {
       id: itemId,
       type: itemType,
@@ -7148,6 +7233,7 @@ export class AppServerProcess {
       data: item as Record<string, unknown>,
       completed: isCompleted,
       turnCompleted: this.hasCompletedTurnEvent(threadId, turnId),
+      latestEquivalentData: null,
       sanitized: false,
       sanitizePromise: null,
       capturedAtMs: Date.now(),
@@ -7164,9 +7250,6 @@ export class AppServerProcess {
     this.pruneCapturedItemsForThread(threadId)
     this.pruneCapturedItemsGlobally()
 
-    const isGeneratedImage = itemType === 'imageGeneration'
-      || itemType === 'image_generation'
-      || itemType === 'imageView'
     if (isGeneratedImage && threadItems.get(itemId) === captured) {
       void this.ensureCapturedItemSanitized(captured, false).then(() => {
         if (threadItems?.get(itemId) !== captured) return
@@ -7317,7 +7400,7 @@ export class AppServerProcess {
         if (!this.isCapturedItemCurrent(task.captured)) return
         const sanitizedItems = await this.capturedItemSanitizer(task.captured.turnId, [task.captured.data])
         if (!this.isCapturedItemCurrent(task.captured)) return
-        const sanitizedData = asRecord(sanitizedItems[0]) ?? task.captured.data
+        let sanitizedData = asRecord(sanitizedItems[0]) ?? task.captured.data
         const isGeneratedImage = task.captured.type === 'imageGeneration'
           || task.captured.type === 'image_generation'
           || task.captured.type === 'imageView'
@@ -7329,6 +7412,13 @@ export class AppServerProcess {
           if (hasPayloadFields || !hasRenderablePath) {
             throw new Error('Generated image sanitization did not produce a payload-free renderable imageView')
           }
+        }
+        if (task.captured.latestEquivalentData) {
+          sanitizedData = mergeEquivalentCapturedImageMetadata(
+            sanitizedData,
+            task.captured.latestEquivalentData,
+          )
+          task.captured.latestEquivalentData = null
         }
         task.captured.data = sanitizedData
         task.captured.sanitized = true
@@ -8759,6 +8849,16 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 	          return
 	        }
 
+        const requestParams = asRecord(body.params)
+        const requestThreadId = typeof requestParams?.threadId === 'string'
+          ? requestParams.threadId.trim()
+          : typeof requestParams?.thread_id === 'string'
+            ? requestParams.thread_id.trim()
+            : ''
+        const requestNotificationGeneration = requestThreadId
+          ? appServer.getNotificationGeneration(requestThreadId)
+          : null
+
         let rpcResult: unknown
         try {
           rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
@@ -8817,10 +8917,6 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const resultThreadId = typeof resultThreadBeforeCaptureMerge?.id === 'string'
           ? resultThreadBeforeCaptureMerge.id
           : ''
-        const resultNotificationGeneration = resultThreadId
-          ? appServer.getNotificationGeneration(resultThreadId)
-          : 0
-
         if (THREAD_METHODS_WITH_TURNS.has(body.method)) {
           const appendMissingCapturedTurns = shouldAppendMissingCapturedTurns(body.method, body.params)
           result = await mergeCapturedItemsIntoThreadResult(appServer, result, appendMissingCapturedTurns)
@@ -8830,8 +8926,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 	          const rpcRecord = asRecord(result)
 	          const rpcThread = asRecord(rpcRecord?.thread)
 	          const rpcThreadId = typeof rpcThread?.id === 'string' ? rpcThread.id : ''
-          if (rpcThreadId && rpcThreadId === resultThreadId) {
-            appServer.storeThreadReadSnapshotIfCurrent(rpcThreadId, resultNotificationGeneration, result)
+          if (rpcThreadId
+            && rpcThreadId === resultThreadId
+            && rpcThreadId === requestThreadId
+            && requestNotificationGeneration !== null) {
+            appServer.storeThreadReadSnapshotIfCurrent(rpcThreadId, requestNotificationGeneration, result)
           }
         }
 
