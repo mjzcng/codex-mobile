@@ -377,11 +377,12 @@ describe('thread inline media sanitization', () => {
     const merged = await mergeCapturedItemsIntoThreadResult(appServer, {
       thread: { id: 'thread-pending', turns: [], status: { type: 'inProgress' } },
     }, shouldAppendMissingCapturedTurns('thread/read', { includeTurns: true })) as {
-      thread: { turns: Array<{ id: string; items: Array<Record<string, unknown>> }> }
+      thread: { turns: Array<{ id: string; status: string; items: Array<Record<string, unknown>> }> }
     }
 
     expect(merged.thread.turns).toHaveLength(1)
     expect(merged.thread.turns[0].id).toBe('turn-pending')
+    expect(merged.thread.turns[0].status).toBe('inProgress')
     expect(merged.thread.turns[0].items[0].type).toBe('imageView')
     expect(merged.thread.turns[0].items[0]).not.toHaveProperty('result')
   })
@@ -403,14 +404,51 @@ describe('thread inline media sanitization', () => {
     const merged = await mergeCapturedItemsIntoThreadResult(appServer, {
       thread: { id: 'thread-success', turns: [], status: { type: 'inProgress' } },
     }, shouldAppendMissingCapturedTurns('thread/read', { includeTurns: true })) as {
-      thread: { turns: Array<{ id: string; items: Array<Record<string, unknown>> }> }
+      thread: { turns: Array<{ id: string; status: string; items: Array<Record<string, unknown>> }> }
     }
 
     expect(merged.thread.turns[0].id).toBe('turn-not-materialized')
+    expect(merged.thread.turns[0].status).toBe('inProgress')
     expect(merged.thread.turns[0].items[0].type).toBe('imageView')
     expect(merged.thread.turns[0].items[0]).not.toHaveProperty('result')
     expect(shouldAppendMissingCapturedTurns('thread/read', { includeTurns: false })).toBe(false)
     expect(shouldAppendMissingCapturedTurns('thread/resume', null)).toBe(true)
+    appServer.dispose()
+  })
+
+  it('does not append an older completed captured turn after newer materialized turns', async () => {
+    const appServer = new AppServerProcess()
+    const internals = appServer as unknown as {
+      emitNotification: (notification: { method: string; params: unknown }) => void
+    }
+    internals.emitNotification({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-ordered-recovery',
+        turnId: 'turn-old',
+        item: { id: 'image-old', type: 'imageGeneration', result: pngBase64 },
+      },
+    })
+    internals.emitNotification({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-ordered-recovery',
+        turn: { id: 'turn-old', status: 'completed' },
+      },
+    })
+
+    const materializedTurns = Array.from({ length: 10 }, (_, index) => ({
+      id: `turn-new-${index}`,
+      status: 'completed',
+      items: [],
+    }))
+    const merged = await appServer.mergeItemsIntoTurns(
+      'thread-ordered-recovery',
+      materializedTurns,
+      true,
+    ) as Array<{ id: string }>
+
+    expect(merged.map((turn) => turn.id)).toEqual(materializedTurns.map((turn) => turn.id))
     appServer.dispose()
   })
 
@@ -1238,6 +1276,16 @@ describe('thread inline media sanitization', () => {
     const persistedPath = await persistence
     expect(persistedPath).toMatch(/\.png$/u)
     expect(existsSync(persistedPath as string)).toBe(true)
+  })
+
+  it('bounds total inline media persistence work instead of retaining overflow waiters', async () => {
+    const queuedPngDataUrl = `data:image/png;base64,${createCompressibleGrayscalePngBase64(2048, 2048)}`
+    const results = await Promise.all(Array.from({ length: 35 }, (_, index) => (
+      persistInlineDataUrlToLocalFile(queuedPngDataUrl, `bounded-validation-${index}`)
+    )))
+
+    expect(results.filter((path) => path === null)).toHaveLength(1)
+    expect(results.filter((path) => typeof path === 'string')).toHaveLength(34)
   })
 
   it('leaves non-image result strings untouched', async () => {
